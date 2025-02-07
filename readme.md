@@ -1,9 +1,11 @@
 # AmbientCG Blender Addon
 
+---
 ## CREDITS
 
 > https://github.com/ninofiliu/blender-ambientcg-addon for the downloading and making material part :))
 
+---
 
 The **AmbientCG Addon** integrates an asset browser into Blender, allowing users to browse and import assets from AmbientCG.
 
