@@ -2,7 +2,6 @@
 
 The **AmbientCG Addon** integrates an asset browser into Blender, allowing users to browse and import assets from AmbientCG.
 
-
 ---
 
 ## 📸 Preview
@@ -18,3 +17,9 @@ To build this addon, a script named `zip.py` is used to package the source folde
 ### Steps:
 1. Run `zip.py` to create the addon package.
 2. Install the generated `.zip` file in Blender via **Edit → Preferences → Add-ons → Install...**
+   
+---
+
+## CREDITS
+
+> https://github.com/ninofiliu/blender-ambientcg-addon for the downloading and making material part :))
