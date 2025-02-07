@@ -18,17 +18,49 @@ import requests
 import urllib.request
 import zipfile
 import webbrowser
+import threading
 from pathlib import Path
 import bpy.utils.previews
 
-# Global dictionary to track downloaded assets
-downloaded_assets = {}  # keys: asset_id, value: True if material created
+# Global dictionaries and locks for preview downloading
+preview_download_threads = {}
+preview_download_lock = threading.Lock()
 
-# Global preview collection for thumbnails
+# -------------------------------------------------------------------
+# Initial Asset Fetching (filtering out HDRIs and Substance materials)
+# -------------------------------------------------------------------
+assets = []
+ASSET_LIST_URL = (
+    "https://ambientcg.com/hx/asset-list?id=&childrenOf=&variationsOf=&parentsOf="
+    "&q=ball&colorMode=&thumbnails=200&sort=popular"
+)
+response = requests.get(ASSET_LIST_URL)
+asset_pattern = re.compile(r'<div class="asset-block" id="asset-([^"]+)">')
+link_pattern  = re.compile(r'<a\s+href="(/view\?id=[^"]+)">')
+img_pattern   = re.compile(r'<img[^>]+class="only-show-dark"[^>]+src="([^"]+)"')
+for match in zip(asset_pattern.finditer(response.text),
+                 link_pattern.finditer(response.text),
+                 img_pattern.finditer(response.text)):
+    asset_id = match[0].group(1)
+    # Skip HDRIs and Substance materials
+    if "hdri" in asset_id.lower() or "substance" in asset_id.lower():
+        continue
+    asset_link = match[1].group(1)
+    asset_img = match[2].group(1)
+    assets.append((asset_id, asset_link, asset_img))
+
+downloaded_assets = {}
+preload_queue = []
+preload_operator_running = False
+search_query = ""
+original_assets = assets.copy()
+current_page = 1
+total_pages = 1
+items_per_page = 20
 preview_collections = {}
 
 # -------------------------------------------------------------------
-# Custom URL operator (to open asset pages)
+# Custom URL operator
 # -------------------------------------------------------------------
 class URL_OT_Open(bpy.types.Operator):
     bl_idname = "url.open"
@@ -41,26 +73,6 @@ class URL_OT_Open(bpy.types.Operator):
         return {'FINISHED'}
 
 # -------------------------------------------------------------------
-# Fetch asset data from AmbientCG using regex
-# -------------------------------------------------------------------
-ASSET_LIST_URL = (
-    "https://ambientcg.com/hx/asset-list?id=&childrenOf=&variationsOf=&parentsOf="
-    "&q=ball&colorMode=&thumbnails=200&sort=popular"
-)
-response = requests.get(ASSET_LIST_URL)
-asset_pattern = re.compile(r'<div class="asset-block" id="asset-([^"]+)">')
-link_pattern  = re.compile(r'<a\s+href="(/view\?id=[^"]+)">')
-img_pattern   = re.compile(r'<img[^>]+class="only-show-dark"[^>]+src="([^"]+)"')
-assets = []
-for match in zip(asset_pattern.finditer(response.text),
-                 link_pattern.finditer(response.text),
-                 img_pattern.finditer(response.text)):
-    asset_id = match[0].group(1)
-    asset_link = match[1].group(1)
-    asset_img = match[2].group(1)
-    assets.append((asset_id, asset_link, asset_img))
-
-# -------------------------------------------------------------------
 # Utility functions
 # -------------------------------------------------------------------
 def get_cache_dir():
@@ -70,41 +82,33 @@ def get_cache_dir():
     return cache_dir
 
 def fetch_and_create_material(material_name, resolution):
-    """
-    Synchronously downloads and extracts the asset ZIP file.
-    Returns a Path object (the extraction folder) on success,
-    or a string (error message) on failure.
-    """
     url = f"https://ambientcg.com/get?file={material_name}_{resolution}-PNG.zip"
     cache_dir = get_cache_dir()
     extract_path = cache_dir / f"{material_name}_{resolution}"
-    
+    zip_path = cache_dir / f"{material_name}_{resolution}.zip"
     if not extract_path.exists():
-        zip_path = cache_dir / f"{material_name}_{resolution}.zip"
-        opener = urllib.request.build_opener()
-        opener.addheaders = [
-            ("User-Agent",
-             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-             "AppleWebKit/537.36 (KHTML, like Gecko) "
-             "Chrome/91.0.4472.124 Safari/537.36")
-        ]
-        urllib.request.install_opener(opener)
-        try:
-            urllib.request.urlretrieve(url, zip_path)
-        except Exception as e:
-            return f"Failed to download file: {str(e)}"
+        if not zip_path.exists():
+            opener = urllib.request.build_opener()
+            opener.addheaders = [
+                ("User-Agent",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/91.0.4472.124 Safari/537.36")
+            ]
+            urllib.request.install_opener(opener)
+            try:
+                urllib.request.urlretrieve(url, zip_path)
+            except Exception as e:
+                return f"Failed to download file: {str(e)}"
         try:
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(extract_path)
-            zip_path.unlink()  # Remove the ZIP file after extraction
+            zip_path.unlink()
         except Exception as e:
             return f"Failed to extract zip file: {str(e)}"
     return extract_path
 
 def create_material_from_extracted(extract_path, asset_name):
-    """
-    Creates a new material using textures found in the extracted folder.
-    """
     material = bpy.data.materials.new(name=asset_name)
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -149,25 +153,35 @@ def create_material_from_extracted(extract_path, asset_name):
             links.new(displacement.outputs["Displacement"], material_output.inputs["Displacement"])
     return material
 
+def download_preview_async(url):
+    image_name = os.path.basename(url)
+    image_path = os.path.join(get_cache_dir(), image_name)
+    try:
+        img_data = requests.get(url).content
+        with open(image_path, 'wb') as handler:
+            handler.write(img_data)
+    except Exception as e:
+        print(f"Failed to download preview image from URL {url}: {e}")
+    with preview_download_lock:
+        if url in preview_download_threads:
+            del preview_download_threads[url]
+
 def get_preview_icon(url):
-    """
-    Loads the image from the given URL into the preview collection (if not already loaded)
-    and returns its icon_id so it can be used with template_icon.
-    """
     pcoll = preview_collections["ambientcg"]
-    # Use the URL as the key name for caching
     if url in pcoll:
         return pcoll[url].icon_id
     else:
+        image_name = os.path.basename(url)
+        image_path = os.path.join(get_cache_dir(), image_name)
+        if not os.path.exists(image_path):
+            with preview_download_lock:
+                if url not in preview_download_threads:
+                    t = threading.Thread(target=download_preview_async, args=(url,))
+                    t.daemon = True
+                    t.start()
+                    preview_download_threads[url] = t
+            return 0
         try:
-            image_name = os.path.basename(url)
-            image_path = os.path.join(get_cache_dir(), image_name)
-            # Download if necessary
-            if not os.path.exists(image_path):
-                img_data = requests.get(url).content
-                with open(image_path, 'wb') as handler:
-                    handler.write(img_data)
-            # Load the image into the preview collection
             preview = pcoll.load(url, image_path, 'IMAGE')
             return preview.icon_id
         except Exception as e:
@@ -175,7 +189,7 @@ def get_preview_icon(url):
             return 0
 
 # -------------------------------------------------------------------
-# Modal download operator with progress
+# Async download operator with progress and material application
 # -------------------------------------------------------------------
 class ASSET_OT_Download(bpy.types.Operator):
     bl_idname = "asset.download"
@@ -183,76 +197,134 @@ class ASSET_OT_Download(bpy.types.Operator):
     
     asset_id: bpy.props.StringProperty()
     
-    # Internal variables for modal download
     _timer = None
-    _generator = None
-    _file = None
+    _download_thread = None
     _total_size = 0
     _downloaded = 0
     _zip_path = ""
-    
+    _download_finished = False
+    _download_error = None
+
     def execute(self, context):
         asset_name = self.asset_id
         resolution = context.scene.ambientcg_resolution
         cache_dir = get_cache_dir()
         extract_path = cache_dir / f"{asset_name}_{resolution}"
         if extract_path.exists():
-            # Already downloaded; create material immediately.
-            create_material_from_extracted(extract_path, asset_name)
+            mat = create_material_from_extracted(extract_path, asset_name)
             downloaded_assets[asset_name] = True
+            obj = context.active_object
+            if obj and len(obj.material_slots) == 1:
+                obj.material_slots[0].material = mat
             self.report({"INFO"}, f"Material '{asset_name}' created using preexisting assets!")
             return {"FINISHED"}
-        # Start streaming download
         url = f"https://ambientcg.com/get?file={asset_name}_{resolution}-PNG.zip"
         context.scene.ambientcg_current_download = asset_name
         context.scene.ambientcg_download_progress = 0.0
         self._zip_path = str(cache_dir / f"{asset_name}_{resolution}.zip")
-        try:
-            r = requests.get(url, stream=True)
-            self._total_size = int(r.headers.get('content-length', 0))
-            self._downloaded = 0
-            self._generator = r.iter_content(chunk_size=int(self._total_size/100))
-            self._file = open(self._zip_path, 'wb')
-        except Exception as e:
-            self.report({"ERROR"}, f"Download error: {e}")
-            return {"CANCELLED"}
+        self._downloaded = 0
+        self._total_size = 0
+        self._download_finished = False
+        self._download_error = None
+        self._download_thread = threading.Thread(target=self.download_thread, args=(url,))
+        self._download_thread.start()
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
         wm.modal_handler_add(self)
         return {"RUNNING_MODAL"}
     
+    def download_thread(self, url):
+        try:
+            r = requests.get(url, stream=True)
+            self._total_size = int(r.headers.get('content-length', 0))
+            with open(self._zip_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+                        self._downloaded += len(chunk)
+            self._download_finished = True
+        except Exception as e:
+            self._download_error = str(e)
+            self._download_finished = True
+
     def modal(self, context, event):
         if event.type == 'TIMER':
-            try:
-                chunk = next(self._generator)
-            except StopIteration:
-                chunk = None
-            if chunk:
-                self._file.write(chunk)
-                self._downloaded += len(chunk)
-                progress = self._downloaded / self._total_size if self._total_size else 1.0
-                context.scene.ambientcg_download_progress = progress
-                context.area.tag_redraw()
+            if self._total_size:
+                progress = self._downloaded / self._total_size
             else:
-                self._file.close()
+                progress = 0.0
+            context.scene.ambientcg_download_progress = progress
+            context.area.tag_redraw()
+            if self._download_finished:
                 wm = context.window_manager
                 wm.event_timer_remove(self._timer)
-                context.scene.ambientcg_current_download = ""
+                if self._download_error:
+                    self.report({"ERROR"}, f"Download error: {self._download_error}")
+                    return {"CANCELLED"}
                 context.scene.ambientcg_download_progress = 1.0
-                # Extraction and material creation
                 result = fetch_and_create_material(self.asset_id, context.scene.ambientcg_resolution)
                 if isinstance(result, str) and "Failed" in result:
                     self.report({"ERROR"}, result)
                     return {"CANCELLED"}
                 extract_path = result
-                create_material_from_extracted(extract_path, self.asset_id)
+                mat = create_material_from_extracted(extract_path, self.asset_id)
                 downloaded_assets[self.asset_id] = True
+                obj = context.active_object
+                if obj and len(obj.material_slots) == 1:
+                    obj.material_slots[0].material = mat
                 self.report({"INFO"}, f"Material '{self.asset_id}' created successfully!")
                 return {"FINISHED"}
         return {"RUNNING_MODAL"}
 
 # -------------------------------------------------------------------
-# Panel to display the asset browser
+# Thumbnail loading system
+# -------------------------------------------------------------------
+def preload_thumbnails():
+    global preload_queue, preload_operator_running
+    if not preload_operator_running and assets:
+        preload_queue = [asset[2] for asset in assets]
+        preload_operator_running = True
+        bpy.app.timers.register(load_next_thumbnail, first_interval=0.1)
+
+def load_next_thumbnail():
+    global preload_queue, preload_operator_running
+    if not preload_queue:
+        preload_operator_running = False
+        return None
+    url = preload_queue.pop(0)
+    pcoll = preview_collections["ambientcg"]
+    if url not in pcoll:
+        get_preview_icon(url)
+    # Force a redraw periodically
+    if len(preload_queue) % 5 == 0:
+        for area in bpy.context.window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    return 0.01 if preload_queue else None
+
+# -------------------------------------------------------------------
+# Search-related functions
+# -------------------------------------------------------------------
+def update_asset_search(query):
+    global assets, search_query, preload_queue, preload_operator_running
+    search_query = query.strip().lower()
+    if not search_query:
+        assets = original_assets.copy()
+    else:
+        filtered = []
+        for asset in original_assets:
+            if search_query in asset[0].lower():
+                filtered.append(asset)
+        assets = filtered
+    # Clear out the preview collection so new thumbnails are loaded
+    if "ambientcg" in preview_collections:
+        preview_collections["ambientcg"].clear()
+    preload_queue = [asset[2] for asset in assets]
+    preload_operator_running = False
+    bpy.app.timers.register(load_next_thumbnail, first_interval=0.1)
+
+# -------------------------------------------------------------------
+# Panel with Search Bar and Pagination
 # -------------------------------------------------------------------
 class ASSET_PT_Menu(bpy.types.Panel):
     bl_label = "AmbientCG Assets"
@@ -263,46 +335,121 @@ class ASSET_PT_Menu(bpy.types.Panel):
     
     def draw(self, context):
         layout = self.layout
-        # Create a grid that flows to fill rows/columns based on available space
-        grid = layout.grid_flow(row_major=True, columns=0, even_columns=True, even_rows=True, align=True)
+        scene = context.scene
+        col = layout.column()
+        row = col.row(align=True)
+        row.prop(scene, "ambientcg_search_query", text="", icon='VIEWZOOM')
+        row.operator("ambientcg.search", text="", icon='FILE_REFRESH').direction = ""
         
+        # pagination_row = col.row(align=True)
+        # if current_page > 1:
+        #     prev_op = pagination_row.operator("ambientcg.search", text="", icon='TRIA_LEFT', emboss=True)
+        #     prev_op.direction = "prev"
+        # else:
+        #     pagination_row.label(text="", icon='BLANK1')
+        # pagination_row.label(text=f"Page {current_page} of {total_pages}")
+        # if current_page < total_pages:
+        #     next_op = pagination_row.operator("ambientcg.search", text="", icon='TRIA_RIGHT', emboss=True)
+        #     next_op.direction = "next"
+        # else:
+        #     pagination_row.label(text="", icon='BLANK1')
+        
+        if search_query:
+            layout.label(text=f"Showing results for: '{search_query}'", icon='FILTER')
+        
+        grid = layout.grid_flow(row_major=True, columns=0, even_columns=True, even_rows=True, align=True)
+        if not preload_operator_running:
+            preload_thumbnails()
+        if not assets:
+            layout.label(text="No assets found matching your search", icon='INFO')
+            return
         for asset_id, asset_link, asset_img in assets:
             col = grid.column(align=True)
             box = col.box()
-            
-            # Thumbnail Preview
-            icon_id = get_preview_icon(asset_img)
-            if icon_id:
-                # Use a scale that fits well within the grid cell
+            pcoll = preview_collections["ambientcg"]
+            preview_loaded = asset_img in pcoll
+            if preview_loaded:
+                icon_id = pcoll[asset_img].icon_id
                 box.template_icon(icon_value=icon_id, scale=5)
             else:
-                box.label(text="Preview Not Available")
-            
-            # Asset Name and Learn More Button
+                box.label(text="Loading Preview...", icon='IMAGE_DATA')
             row = box.row()
             learn_op = row.operator("url.open", text=asset_id, icon='INFO')
             learn_op.url = f"https://ambientcg.com{asset_link}"
-            
-            # Resolution Dropdown
             row = box.row()
-            row.prop(context.scene, "ambientcg_resolution", text="Resolution")
-            
-            # Download Button/Status
+            row.prop(scene, "ambientcg_resolution", text="Resolution")
             row = box.row()
             if asset_id in downloaded_assets:
                 row.label(text="Downloaded", icon='CHECKMARK')
-            elif context.scene.ambientcg_current_download == asset_id:
-                row.label(text=f"Downloading: {int(context.scene.ambientcg_download_progress * 100)}%", icon='IMPORT')
+            elif scene.ambientcg_current_download == asset_id:
+                row.label(text=f"Downloading: {int(scene.ambientcg_download_progress * 100)}%", icon='IMPORT')
             else:
                 download_op = row.operator("asset.download", text="Download", icon='IMPORT')
                 download_op.asset_id = asset_id
 
 # -------------------------------------------------------------------
+# Search Operator with Pagination
+# -------------------------------------------------------------------
+class AMBIENTCG_OT_Search(bpy.types.Operator):
+    bl_idname = "ambientcg.search"
+    bl_label = "Search AmbientCG Assets"
+    
+    direction: bpy.props.StringProperty(default="")
+    
+    def execute(self, context):
+        global current_page, total_pages
+        scene = context.scene
+        if self.direction == "next":
+            current_page += 1
+        elif self.direction == "prev":
+            current_page = max(1, current_page - 1)
+        else:
+            current_page = 1
+        offset = (current_page - 1) * items_per_page
+        ASSET_LIST_URL = (
+            f"https://ambientcg.com/hx/asset-list?"
+            f"q={scene.ambientcg_search_query}"
+            f"&colorMode=&thumbnails=200&sort=popular"
+            f"&offset={offset}&count={items_per_page}"
+        )
+        try:
+            response = requests.get(ASSET_LIST_URL)
+            asset_pattern = re.compile(r'<div class="asset-block" id="asset-([^"]+)">')
+            link_pattern = re.compile(r'<a\s+href="(/view\?id=[^"]+)">')
+            img_pattern = re.compile(r'<img[^>]+class="only-show-dark"[^>]+src="([^"]+)"')
+            total_pattern = re.compile(r'Showing \d+ - \d+ of (\d+) results')
+            total_match = total_pattern.search(response.text)
+            total_results = int(total_match.group(1)) if total_match else 0
+            total_pages = max(1, (total_results + items_per_page - 1) // items_per_page)
+            global assets, original_assets
+            assets = []
+            for match in zip(asset_pattern.finditer(response.text),
+                             link_pattern.finditer(response.text),
+                             img_pattern.finditer(response.text)):
+                asset_id = match[0].group(1)
+                # Filter out HDRIs and Substance materials
+                if "hdri" in asset_id.lower() or "substance" in asset_id.lower():
+                    continue
+                asset_link = match[1].group(1)
+                asset_img = match[2].group(1)
+                assets.append((asset_id, asset_link, asset_img))
+            original_assets = assets.copy()
+            update_asset_search(scene.ambientcg_search_query)
+        except Exception as e:
+            self.report({'ERROR'}, f"Search failed: {str(e)}")
+        return {'FINISHED'}
+
+# -------------------------------------------------------------------
 # Registration
 # -------------------------------------------------------------------
-classes = [URL_OT_Open, ASSET_OT_Download, ASSET_PT_Menu]
+classes = [URL_OT_Open, ASSET_OT_Download, ASSET_PT_Menu, AMBIENTCG_OT_Search]
 
 def register():
+    bpy.types.Scene.ambientcg_search_query = bpy.props.StringProperty(
+        name="Search",
+        description="Search for AmbientCG assets",
+        default=""
+    )
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ambientcg_resolution = bpy.props.EnumProperty(
@@ -318,20 +465,22 @@ def register():
     )
     bpy.types.Scene.ambientcg_current_download = bpy.props.StringProperty(default="")
     bpy.types.Scene.ambientcg_download_progress = bpy.props.FloatProperty(default=0.0, min=0.0, max=1.0)
-    
-    # Create our preview collection for thumbnails
     global preview_collections
     pcoll = bpy.utils.previews.new()
     preview_collections["ambientcg"] = pcoll
 
 def unregister():
+    global preload_queue, preload_operator_running
+    preload_queue = []
+    preload_operator_running = False
+    if bpy.app.timers.is_registered(load_next_thumbnail):
+        bpy.app.timers.unregister(load_next_thumbnail)
     for cls in classes:
         bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.ambientcg_search_query
     del bpy.types.Scene.ambientcg_resolution
     del bpy.types.Scene.ambientcg_current_download
     del bpy.types.Scene.ambientcg_download_progress
-    
-    # Remove our preview collection
     global preview_collections
     for pcoll in preview_collections.values():
         bpy.utils.previews.remove(pcoll)
