@@ -2,6 +2,7 @@
 
 The **AmbientCG Addon** integrates an asset browser into Blender, allowing users to browse and import assets from AmbientCG.
 
+## WHEN YOU TYPE A QUERY IN THE SEARCH BAR, YOU MIGHT HAVE TO REFRESH TWICE TO SEE THE IMAGES
 ---
 
 ## 📸 Preview
